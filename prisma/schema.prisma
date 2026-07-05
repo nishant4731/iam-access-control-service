@@ -1,0 +1,353 @@
+// =============================================================================
+// Enterprise IAM Access Control Service — Prisma schema
+//
+// Design notes:
+//  * Every tenant-scoped table carries `tenantId` and is indexed by it. Tenant
+//    isolation is enforced at the repository layer (see BaseTenantRepository).
+//  * Organization hierarchy is materialised in a CLOSURE TABLE
+//    (OrganizationHierarchyClosure) — authorization never traverses the manager
+//    chain recursively.
+//  * Policies are DATA, not code: their conditions live in a typed JSON column
+//    that the PolicyEvaluator interprets at decision time.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" targets the local dev machine; the explicit musl targets cover the
+  // Alpine-based Docker runtime (both OpenSSL variants) so the query engine is
+  // always present regardless of the base image's OpenSSL version.
+  binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  ON_LEAVE
+  SUSPENDED
+  TERMINATED
+}
+
+/// Ordered from least to most sensitive. Comparison is by ordinal rank
+/// (see ClearanceLevel util) — higher clearance may access lower sensitivity.
+enum ClearanceLevel {
+  PUBLIC
+  INTERNAL
+  CONFIDENTIAL
+  SECRET
+  TOP_SECRET
+}
+
+enum PolicyEffect {
+  ALLOW
+  DENY
+}
+
+// NOTE: RelationshipType (SELF/DIRECT_MANAGER/ANCESTOR/SIBLING/NONE) is a
+// COMPUTED concept derived from the closure table at decision time — it is
+// never persisted, so it lives as a TypeScript enum in
+// src/common/enums/relationship-type.enum.ts rather than as a DB enum.
+
+enum AccessDecision {
+  ALLOW
+  DENY
+}
+
+// -----------------------------------------------------------------------------
+// Tenancy & organization
+// -----------------------------------------------------------------------------
+
+model Tenant {
+  id     String       @id @default(uuid())
+  name   String
+  slug   String       @unique
+  status TenantStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  departments        Department[]
+  users              User[]
+  roles              Role[]
+  permissions        Permission[]
+  policies           Policy[]
+  resources          Resource[]
+  auditLogs          AccessAuditLog[]
+  serviceIdentities  ServiceIdentity[]
+  hierarchyClosures  OrganizationHierarchyClosure[]
+
+  @@map("tenants")
+}
+
+model Department {
+  id                 String  @id @default(uuid())
+  tenantId           String
+  name               String
+  parentDepartmentId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant           Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parentDepartment Department?  @relation("DepartmentHierarchy", fields: [parentDepartmentId], references: [id])
+  childDepartments Department[] @relation("DepartmentHierarchy")
+  users            User[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, parentDepartmentId])
+  @@map("departments")
+}
+
+model User {
+  id               String           @id @default(uuid())
+  tenantId         String
+  departmentId     String?
+  managerId        String?
+  email            String
+  passwordHash     String?
+  designation      String?
+  clearanceLevel   ClearanceLevel   @default(INTERNAL)
+  location         String?
+  employmentStatus EmploymentStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [departmentId], references: [id])
+  manager    User?       @relation("UserManager", fields: [managerId], references: [id])
+  reports    User[]      @relation("UserManager")
+
+  userRoles UserRole[]
+
+  // Closure-table participation
+  ancestorClosures   OrganizationHierarchyClosure[] @relation("ClosureAncestor")
+  descendantClosures OrganizationHierarchyClosure[] @relation("ClosureDescendant")
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@index([tenantId, departmentId])
+  @@index([tenantId, managerId])
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// RBAC — roles & permissions
+// -----------------------------------------------------------------------------
+
+model Role {
+  id          String  @id @default(uuid())
+  tenantId    String
+  name        String
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model Permission {
+  id       String @id @default(uuid())
+  tenantId String
+  /// Canonical name, e.g. "employee.performance.view"
+  name     String
+  /// Resource type, e.g. "employee"
+  resource String
+  /// Action verb, e.g. "performance.view" / "approve"
+  action   String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  rolePermissions RolePermission[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, resource, action])
+  @@map("permissions")
+}
+
+model UserRole {
+  id       String @id @default(uuid())
+  tenantId String
+  userId   String
+  roleId   String
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId, roleId])
+  @@index([tenantId, userId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  id           String @id @default(uuid())
+  tenantId     String
+  roleId       String
+  permissionId String
+
+  createdAt DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, roleId, permissionId])
+  @@index([tenantId, roleId])
+  @@map("role_permissions")
+}
+
+// -----------------------------------------------------------------------------
+// Resources (ABAC subject) & Policies (policy engine)
+// -----------------------------------------------------------------------------
+
+model Resource {
+  id           String         @id @default(uuid())
+  tenantId     String
+  /// Business identifier the calling service knows the resource by.
+  externalId   String
+  type         String
+  /// Owner of the resource (e.g. the employee a performance record belongs to).
+  ownerUserId  String?
+  departmentId String?
+  sensitivity  ClearanceLevel @default(INTERNAL)
+  /// Arbitrary additional attributes for ABAC evaluation.
+  attributes   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, type, externalId])
+  @@index([tenantId])
+  @@index([tenantId, type])
+  @@map("resources")
+}
+
+model Policy {
+  id          String       @id @default(uuid())
+  tenantId    String
+  name        String
+  description String?
+  effect      PolicyEffect
+  /// Action this policy governs, e.g. "employee.performance.view". "*" = any.
+  action      String
+  /// Resource type this policy governs, e.g. "employee". "*" = any.
+  resourceType String      @default("*")
+  /// Typed condition document (see PolicyCondition contract in code).
+  conditions  Json
+  /// Lower number = evaluated first. DENY still overrides regardless of order.
+  priority    Int          @default(100)
+  enabled     Boolean      @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, action])
+  @@index([tenantId, enabled])
+  @@map("policies")
+}
+
+// -----------------------------------------------------------------------------
+// Organization hierarchy — CLOSURE TABLE
+// One row for every (ancestor, descendant) pair, including self (depth 0).
+// -----------------------------------------------------------------------------
+
+model OrganizationHierarchyClosure {
+  id               String @id @default(uuid())
+  tenantId         String
+  ancestorUserId   String
+  descendantUserId String
+  depth            Int
+
+  ancestor   User @relation("ClosureAncestor", fields: [ancestorUserId], references: [id], onDelete: Cascade)
+  descendant User @relation("ClosureDescendant", fields: [descendantUserId], references: [id], onDelete: Cascade)
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, ancestorUserId, descendantUserId])
+  @@index([tenantId, ancestorUserId])
+  @@index([tenantId, descendantUserId])
+  @@index([tenantId, ancestorUserId, depth])
+  @@map("organization_hierarchy_closure")
+}
+
+// -----------------------------------------------------------------------------
+// Service identities (service-to-service callers)
+// -----------------------------------------------------------------------------
+
+model ServiceIdentity {
+  id          String  @id @default(uuid())
+  tenantId    String
+  name        String
+  apiKeyHash  String
+  enabled     Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("service_identities")
+}
+
+// -----------------------------------------------------------------------------
+// Audit — immutable log of every authorization decision
+// -----------------------------------------------------------------------------
+
+model AccessAuditLog {
+  id              String         @id @default(uuid())
+  tenantId        String
+  decisionId      String         @unique
+  subjectUserId   String?
+  action          String
+  resourceType    String
+  resourceId      String?
+  decision        AccessDecision
+  reason          String
+  /// Names of the policies that matched, for traceability.
+  matchedPolicies String[]
+  /// Full ordered evaluation trace (RBAC/ABAC/ReBAC/policy steps).
+  evaluationTrace Json?
+  correlationId   String?
+  latencyMs       Int?
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, subjectUserId])
+  @@index([tenantId, createdAt])
+  @@map("access_audit_logs")
+}
